@@ -1,5 +1,8 @@
-package main
+package sample
+
+import "fmt"
 
 func main() {
+	fmt.Println("Sample go-proxy")
 
 }
