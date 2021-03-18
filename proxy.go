@@ -1,82 +1,102 @@
-package proxy
+package main
 
 import (
-	"context"
+	"flag"
 	"fmt"
-	"github.com/labstack/echo"
-	"github.com/labstack/echo/middleware"
-	"github.com/labstack/gommon/log"
+	"io/ioutil"
 	"net/http"
-	"os"
-	"os/signal"
 	"time"
 )
 
-type Config struct {
-	LocalPort string `json:"local_port"`
-	RemoteHost string `json:"remote_host"`
-	RemotePort string `json:"remote_port"`
+const (
+	DefaultPort = 8383
+	HeaderRequestUrl = "Go-Proxy-Request-Url"
+)
+
+var url = ""
+var headerExclude = []string{HeaderRequestUrl}
+
+func main() {
+	var pn int
+	flag.IntVar(&pn, "p", DefaultPort, "port number (default: 8080)")
+
+	var u string
+	flag.StringVar(&u, "url", "", "remote url (default: '', use 'Go-Proxy-Request-Url' in header)")
+
+	flag.Parse()
+
+	port := fmt.Sprintf(":%d", pn)
+	url = u
+
+	start(port)
 }
 
-
-var DefaultConfig = &Config{
-	LocalPort: "8080",
-	RemoteHost: "",
-	RemotePort: "",
-}
-
-var config = DefaultConfig
-
-func NewProxy(c *Config) {
-	config = DefaultConfig
-}
-
-func Start() {
+func start(port string) {
 	fmt.Println("********************** Proxy Starting **********************")
-	e := echo.New()
-	e.Debug = true
-	e.Use(middleware.GzipWithConfig(middleware.GzipConfig{
-		Level: 9,
-	}))
-	e.Use(middleware.RequestID())
-	e.Use(middleware.Recover())
-	e.Use(middleware.Logger())
-
-	e.Use(middleware.CORSWithConfig(middleware.CORSConfig{
-		AllowOrigins:  []string{"*"},
-		AllowMethods:  []string{echo.GET, echo.HEAD, echo.PUT, echo.PATCH, echo.POST, echo.DELETE},
-		ExposeHeaders: []string{"Authorization"},
-	}))
-
-	e.Logger.SetLevel(log.DEBUG)
-	e.HideBanner = true
-
-	// set endpoints
-	e.GET("/*", request)
-	e.POST("/*", request)
-
-	// start server
-	go func() {
-		if err := e.Start(config.LocalPort); err != nil {
-			e.Logger.Info(err)
-			e.Logger.Info("shutting down the server")
-		}
-	}()
-
-	// wait for interrupt signal to gracefully shutdown the server with
-	// a timeout of 10 seconds.
-	quit := make(chan os.Signal)
-	signal.Notify(quit, os.Interrupt)
-	<-quit
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err := e.Shutdown(ctx); err != nil {
-		e.Logger.Fatal(err)
-	}
-
+	http.HandleFunc("/", request)
+	http.ListenAndServe(port, nil)
 	fmt.Println("********************** Proxy Shutdown **********************")
 }
 
-func request(c echo.Context) error {
-	return c.String(http.StatusBadGateway, "request failed")
+func request(w http.ResponseWriter, r *http.Request) {
+	if url == "" {
+		url = r.Header.Get(HeaderRequestUrl)
+	}
+
+	if url == "" {
+		w.WriteHeader(500)
+		_, _ = w.Write([]byte("error: no remote url provided"))
+		return
+	}
+
+	remote := fmt.Sprintf("%s%s", url, r.URL.Path)
+	fmt.Println(remote)
+
+	// TODO: Exclude some headers
+	req, err := http.NewRequest(r.Method, remote, r.Body)
+	if err != nil {
+		w.WriteHeader(500)
+		_, _ = w.Write([]byte("error: " + err.Error()))
+		return
+	}
+
+	for name, h := range r.Header {
+		if !excludeHeader(name) {
+			for _, h := range h {
+				req.Header.Set(name, h)
+			}
+		}
+	}
+
+	timeout := time.Duration(30 * time.Second)
+	client := &http.Client{
+		Timeout: timeout,
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		w.WriteHeader(500)
+		_, _ = w.Write([]byte("error: " + err.Error()))
+		return
+	}
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		w.WriteHeader(500)
+		_, _ = w.Write([]byte("error: " + err.Error()))
+		return
+	}
+
+	w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
+	_, _ = w.Write(body)
+}
+
+func excludeHeader(header string) bool {
+	for _, h := range headerExclude {
+		if h == header {
+			return true
+		}
+	}
+
+	return false
 }
